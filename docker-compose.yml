@@ -1,0 +1,117 @@
+services:
+  promtail:
+    image: grafana/promtail:latest
+    container_name: todo-promtail
+    ports:
+      - "${PROMTAIL_PORT}:9080"
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./grafana/promtail-config.yml:/etc/promtail/config.yml
+    command: -config.file=/etc/promtail/config.yml
+    privileged: true
+
+  loki:
+    image: grafana/loki:latest
+    container_name: todo-bot-loki
+    ports:
+      - "${LOKI_PORT}:3100"
+    volumes:
+      - ./grafana/loki-config.yml:/etc/loki/local-config.yaml
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: todo-grafana
+    ports:
+      - "${GRAFANA_PORT}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD}
+    volumes:
+      - ./grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yaml
+      - grafana_data:/var/lib/grafana
+
+  redis:
+    container_name: todo-redis
+    image: redis:8-alpine
+    volumes:
+      - redis_data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ./redis/redis.acl:/usr/local/etc/redis/redis.acl:ro
+    command: redis-server /usr/local/etc/redis/redis.conf
+    environment:
+      REDISCLI_AUTH: ${REDIS_HEALTHCHECK_PASSWORD}
+    healthcheck:
+      test: [ "CMD", "redis-cli", "--user", "healthcheck", "ping" ]
+      start_period: 5s
+      interval: 1m
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  rabbitmq:
+    container_name: todo-rabbitmq
+    image: rabbitmq:4-management
+    env_file:
+      - .env
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    ports:
+      - "${RABBITMQ_PORT}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "-q", "ping" ]
+      start_period: 20s
+      interval: 1m
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  rabbitmq-init:
+    container_name: todo-rabbitmq-init
+    image: rabbitmq:4-management
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./rabbitmq/definitions.json:/definitions.json:ro
+    environment:
+      RABBITMQ_HOST: ${RABBITMQ_HOST}
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+    command: >
+      sh -c 'rabbitmqadmin --non-interactive
+      --host "$$RABBITMQ_HOST" --username "$$RABBITMQ_USER" --password "$$RABBITMQ_PASSWORD"
+      definitions import --file /definitions.json'
+    restart: "no"
+
+  pg:
+    container_name: todo-pg
+    image: postgres:16
+    env_file:
+      - .env
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
+      start_period: 5s
+      interval: 1m
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  grafana_data:
+  rabbitmq_data:
+  pg_data:
+
+networks:
+  default:
+    external: true
+    name: todo-network

@@ -1,0 +1,28 @@
+{
+  "exchanges": [
+    {
+      "name": "todo.tasks",
+      "vhost": "/",
+      "type": "topic",
+      "durable": true,
+      "auto_delete": false
+    }
+  ],
+  "bindings": [
+    {
+      "source": "todo.tasks",
+      "vhost": "/",
+      "destination": "todo-bot.tasks",
+      "destination_type": "queue",
+      "routing_key": "tasks.#"
+    }
+  ],
+  "queues": [
+    {
+      "name": "todo-bot.tasks",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false
+    }
+  ]
+}

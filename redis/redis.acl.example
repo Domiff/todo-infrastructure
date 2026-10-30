@@ -1,0 +1,3 @@
+user default off
+user todo-bot on >CHANGE_ME_BOT_PASSWORD ~fsm:* +@read +@write +@keyspace -@dangerous
+user healthcheck on >CHANGE_ME_HEALTHCHECK_PASSWORD +ping
