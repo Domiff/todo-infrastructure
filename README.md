@@ -80,15 +80,39 @@ not by the services: todo-api only publishes to an exchange, todo-bot only consu
 
 ```
 todo-api ──> todo.tasks (topic) ──tasks.#──> todo-bot.tasks ──> todo-bot
+                                                   │
+                                                rejected
+                                                   ▼
+                     todo.tasks.dlx (direct) ──todo-bot.tasks──> todo-bot.tasks.dlq
 ```
 
-| Object           | Type          | Notes                                                    |
-|------------------|---------------|----------------------------------------------------------|
-| `todo.tasks`     | topic exchange, durable | todo-api publishes task events here            |
-| `todo-bot.tasks` | queue, durable          | consumed by todo-bot                           |
-| binding          | `tasks.#`               | every task event (`tasks.created`, `tasks.deleted`, ...) |
+| Object               | Type                     | Notes                                                    |
+|----------------------|--------------------------|----------------------------------------------------------|
+| `todo.tasks`         | topic exchange, durable  | todo-api publishes task events here                      |
+| `todo-bot.tasks`     | queue, durable           | consumed by todo-bot                                     |
+| binding              | `tasks.#`                | every task event (`tasks.created`, `tasks.deleted`, ...) |
+| `todo.tasks.dlx`     | direct exchange, durable | receives dead messages from `todo-bot.tasks`             |
+| `todo-bot.tasks.dlq` | queue, durable           | stores dead messages; nothing consumes it                |
+| binding              | `todo-bot.tasks`         | from `todo.tasks.dlx` to `todo-bot.tasks.dlq`            |
 
-How it is applied: the broker starts with the user from `RABBITMQ_USER` / `RABBITMQ_PASSWORD`,
+### Dead letter queue
+
+A message that todo-bot rejects without requeue is moved to `todo-bot.tasks.dlq` instead of being
+deleted. RabbitMQ adds an `x-death` header with the source queue, the reason and the time.
+
+This is configured with policies, not queue arguments, so it applies to existing queues:
+
+| Policy                  | Queue                | Settings                                                     |
+|-------------------------|----------------------|--------------------------------------------------------------|
+| `todo-tasks-dlx`        | `todo-bot.tasks`     | `dead-letter-exchange`, `dead-letter-routing-key`            |
+| `todo-tasks-dlq-limits` | `todo-bot.tasks.dlq` | `message-ttl` 14 days, `max-length` 10000 (oldest removed)  |
+
+Messages leaving the DLQ by TTL or length limit are deleted permanently. To inspect or move
+messages, use the queue's page in the management UI.
+
+### How it is applied
+
+The broker starts with the user from `RABBITMQ_USER` / `RABBITMQ_PASSWORD`,
 and once it is healthy the one-shot `rabbitmq-init` container imports `definitions.json` through
 the management API (`rabbitmqadmin definitions import`) and exits.
 
