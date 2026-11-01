@@ -6,6 +6,13 @@
       "type": "topic",
       "durable": true,
       "auto_delete": false
+    },
+    {
+      "name": "todo.tasks.dlx",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false
     }
   ],
   "bindings": [
@@ -15,6 +22,13 @@
       "destination": "todo-bot.tasks",
       "destination_type": "queue",
       "routing_key": "tasks.#"
+    },
+    {
+      "source": "todo.tasks.dlx",
+      "vhost": "/",
+      "destination": "todo-bot.tasks.dlq",
+      "destination_type": "queue",
+      "routing_key": "todo-bot.tasks"
     }
   ],
   "queues": [
@@ -23,6 +37,34 @@
       "vhost": "/",
       "durable": true,
       "auto_delete": false
+    },
+    {
+      "name": "todo-bot.tasks.dlq",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false
+    }
+  ],
+  "policies": [
+    {
+      "name": "todo-tasks-dlx",
+      "vhost": "/",
+      "pattern": "^todo-bot\\.tasks$",
+      "apply-to": "queues",
+      "definition": {
+        "dead-letter-exchange": "todo.tasks.dlx",
+        "dead-letter-routing-key": "todo-bot.tasks"
+      }
+    },
+    {
+      "name": "todo-tasks-dlq-limits",
+      "vhost": "/",
+      "pattern": "^todo-bot\\.tasks\\.dlq$",
+      "apply-to": "queues",
+      "definition": {
+        "message-ttl": 1209600000,
+        "max-length": 10000
+      }
     }
   ]
 }
