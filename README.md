@@ -14,8 +14,8 @@ external Docker network **`todo-network`**.
 | RabbitMQ 4    | `todo-rabbitmq`      | `todo-rabbitmq:5672`          | `RABBITMQ_PORT`, `RABBITMQ_MANAGEMENT_PORT` | todo-api, todo-bot |
 | rabbitmq-init | `todo-rabbitmq-init` | —                             | —                                           | one-shot job       |
 | Grafana       | `todo-grafana`       | `todo-grafana:3000`           | `GRAFANA_PORT`                              | you                |
-| Loki          | `todo-bot-loki`      | `loki:3100`                   | `LOKI_PORT`                                 | Promtail, Grafana  |
-| Promtail      | `todo-promtail`      | —                             | `PROMTAIL_PORT`                             | —                  |
+| Loki          | `todo-loki`          | `todo-loki:3100`              | `LOKI_PORT`                                 | Alloy, Grafana     |
+| Alloy         | `todo-alloy`         | —                             | `ALLOY_PORT`                                | —                  |
 
 Services should reach each other by **container name** (`todo-pg`, `todo-redis`, `todo-rabbitmq`):
 container names are unique in the shared network, while service names like `pg` or `redis` may
@@ -49,7 +49,7 @@ clash with other compose projects attached to it.
    GF_SECURITY_ADMIN_USER=
    GF_SECURITY_ADMIN_PASSWORD=
    LOKI_PORT=3100
-   PROMTAIL_PORT=9080
+   ALLOY_PORT=12347
    ```
 
    The services (todo-api, todo-bot) must use the same `POSTGRES_*` and `RABBITMQ_*` credentials
@@ -144,7 +144,7 @@ Configuration (`redis/redis.conf`):
 | `appendonly yes`, `appendfsync everysec`      | AOF journal: at most ~1 second of writes lost on a crash |
 | `save 3600 1 300 100 60 10000`                | RDB snapshots in addition to AOF                        |
 | `maxmemory 128mb`, `maxmemory-policy noeviction` | memory cap; writes fail instead of silently evicting FSM state |
-| `logfile ""`                                  | logs go to stdout (`docker logs`, Promtail)             |
+| `logfile ""`                                  | logs go to stdout (`docker logs`, Alloy)                |
 
 Users (`redis/redis.acl`, created from [`redis/redis.acl.example`](redis/redis.acl.example)):
 
@@ -163,8 +163,28 @@ user stays enabled without a password, so `protected-mode` rejects the bot.
 
 ## Logs
 
-Promtail reads the logs of all Docker containers on the host and ships them to Loki; Grafana has
-Loki provisioned as a datasource (`grafana/datasources.yml`).
+Logs are collected by [Grafana Alloy](https://grafana.com/docs/alloy/latest/) and stored in Loki:
+
+```
+Docker containers ──> Alloy ──> Loki ──> Grafana
+```
+
+- **Alloy** ([`alloy/config.alloy`](alloy/config.alloy)) discovers all containers on the host
+  through the Docker socket (`discovery.docker`), reads their logs (`loki.source.docker`) and
+  pushes them to `http://loki:3100/loki/api/v1/push` (`loki.write`). Every stream gets the labels
+  `service_name` (container name without the leading `/`, e.g. `todo-api`) and `platform="docker"`.
+- **Loki** ([`loki/config.yml`](loki/config.yml)) is a single-node instance with filesystem storage
+  and the `tsdb` / `v13` schema. Retention is 7 days (`retention_period: 168h`, applied by the
+  compactor).
+- **Grafana** has Loki provisioned as a datasource ([`grafana/datasources.yml`](grafana/datasources.yml)).
+
+Example query in Grafana → Explore:
+
+```logql
+{service_name="todo-bot"} |= "error"
+```
+
+Alloy UI (pipeline graph and component health): `http://localhost:${ALLOY_PORT}`.
 
 Grafana: `http://localhost:${GRAFANA_PORT}`, credentials from `GF_SECURITY_ADMIN_*`.
 
@@ -176,6 +196,7 @@ Grafana: `http://localhost:${GRAFANA_PORT}`, credentials from `GF_SECURITY_ADMIN
 | RabbitMQ        | `todo-infrastructure_rabbitmq_data`        |
 | Redis (bot FSM) | `todo-infrastructure_redis_data`           |
 | Grafana         | `todo-infrastructure_grafana_data`         |
+| Loki (logs)     | `todo-infrastructure_loki_data`            |
 
 `docker compose down` keeps the data; `docker compose down -v` deletes the volumes.
 
@@ -184,10 +205,12 @@ Grafana: `http://localhost:${GRAFANA_PORT}`, credentials from `GF_SECURITY_ADMIN
 ```
 .
 ├── docker-compose.yml
-├── grafana/                # Grafana Labs stack: Grafana, Loki, Promtail
-│   ├── datasources.yml     # Grafana → Loki datasource
-│   ├── loki-config.yml
-│   └── promtail-config.yml
+├── alloy/
+│   └── config.alloy        # log collection: Docker containers → Loki
+├── grafana/
+│   └── datasources.yml     # Grafana → Loki datasource
+├── loki/
+│   └── config.yml          # Loki storage, schema and retention
 ├── rabbitmq/
 │   └── definitions.json    # RabbitMQ topology (exchanges, queues, bindings)
 └── redis/
