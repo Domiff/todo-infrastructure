@@ -4,8 +4,10 @@ services:
     container_name: todo-alloy
     restart: unless-stopped
     command:
-      - run
-      - /etc/alloy/config.alloy
+    - run
+    - --server.http.listen-addr=0.0.0.0:12347
+    - --storage.path=/var/lib/alloy/data
+    - /etc/alloy/config.alloy
     ports:
       - "${ALLOY_PORT}:12347"
     volumes:
