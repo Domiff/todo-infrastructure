@@ -1,23 +1,27 @@
 services:
-  promtail:
-    image: grafana/promtail:latest
-    container_name: todo-promtail
+  alloy:
+    image: grafana/alloy:v1.21.3
+    container_name: todo-alloy
+    restart: unless-stopped
+    command:
+      - run
+      - /etc/alloy/config.alloy
     ports:
-      - "${PROMTAIL_PORT}:9080"
+      - "${ALLOY_PORT}:12347"
     volumes:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./grafana/promtail-config.yml:/etc/promtail/config.yml
-    command: -config.file=/etc/promtail/config.yml
-    privileged: true
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+    depends_on:
+      - loki
 
   loki:
     image: grafana/loki:latest
-    container_name: todo-bot-loki
+    container_name: todo-loki
     ports:
       - "${LOKI_PORT}:3100"
     volumes:
-      - ./grafana/loki-config.yml:/etc/loki/local-config.yaml
+      - ./loki/config.yml:/etc/loki/local-config.yaml
 
   grafana:
     image: grafana/grafana:latest
