@@ -23,6 +23,7 @@ services:
     ports:
       - "${LOKI_PORT}:3100"
     volumes:
+      - loki_data:/loki
       - ./loki/config.yml:/etc/loki/local-config.yaml
 
   grafana:
@@ -116,6 +117,7 @@ volumes:
   grafana_data:
   rabbitmq_data:
   pg_data:
+  loki_data:
 
 networks:
   default:
