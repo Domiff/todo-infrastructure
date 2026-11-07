@@ -1,0 +1,7 @@
+{$SITE_ADDRESS} {
+    handle_path /static/* {
+        root * /srv/static
+        file_server
+    }
+    reverse_proxy todo-backend:8000
+}
