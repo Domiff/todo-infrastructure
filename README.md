@@ -16,6 +16,7 @@ external Docker network **`todo-network`**.
 | Grafana       | `todo-grafana`       | `todo-grafana:3000`           | `GRAFANA_PORT`                              | you                |
 | Loki          | `todo-loki`          | `todo-loki:3100`              | `LOKI_PORT`                                 | Alloy, Grafana     |
 | Alloy         | `todo-alloy`         | —                             | `ALLOY_PORT`                                | —                  |
+| Caddy         | `todo-caddy`         | —                             | `CADDY_HTTP_PORT`, `CADDY_HTTPS_PORT`, `CADDY_PORT` | browsers → todo-api |
 
 Services should reach each other by **container name** (`todo-pg`, `todo-redis`, `todo-rabbitmq`):
 container names are unique in the shared network, while service names like `pg` or `redis` may
@@ -23,11 +24,14 @@ clash with other compose projects attached to it.
 
 ## Getting started
 
-1. Create the shared network once:
+1. Create the shared network and the static files volume once:
 
    ```bash
    docker network create todo-network
+   docker volume create todo-static
    ```
+
+   `todo-static` is shared with todo-api, see [Reverse proxy](#reverse-proxy).
 
 2. Create `.env` next to `docker-compose.yml` (it is gitignored):
 
@@ -50,6 +54,11 @@ clash with other compose projects attached to it.
    GF_SECURITY_ADMIN_PASSWORD=
    LOKI_PORT=3100
    ALLOY_PORT=12347
+
+   SITE_ADDRESS=:8080                # Caddy site address: `:8080` locally, a domain in production
+   CADDY_PORT=8080                   # host port for the local site (container port 8080)
+   CADDY_HTTP_PORT=80                # host port for HTTP (container port 80)
+   CADDY_HTTPS_PORT=443              # host port for HTTPS (container port 443)
    ```
 
    The services (todo-api, todo-bot) must use the same `POSTGRES_*` and `RABBITMQ_*` credentials
@@ -72,6 +81,75 @@ clash with other compose projects attached to it.
 Start order for the whole system: **todo-infrastructure → todo-api → todo-bot**. The services have
 no `depends_on` on this stack (Compose cannot depend on another project), so the infrastructure
 must already be healthy when they start.
+
+## Reverse proxy
+
+[Caddy](https://caddyserver.com/docs/) is the entry point for todo-api. It serves the Django static
+files itself and forwards everything else to the backend:
+
+```
+                    ┌─────────────────── todo-caddy ───────────────────┐
+browser ──HTTP(S)──>│  /static/*  → /srv/static (volume todo-static)   │
+                    │  everything else → todo-backend:8000 (Daphne)    │
+                    └──────────────────────────────────────────────────┘
+```
+
+The config is [`caddy/Caddyfile`](caddy/Caddyfile). The site address comes from `SITE_ADDRESS` in
+`.env` (`{$SITE_ADDRESS}` is substituted when Caddy loads the config, so restart Caddy after
+changing it).
+
+| `SITE_ADDRESS`     | Caddy listens on   | Published as                          | Open in the browser                  | HTTPS                                    |
+|--------------------|--------------------|---------------------------------------|--------------------------------------|------------------------------------------|
+| `:8080` (local)    | `8080`             | `CADDY_PORT`                          | `http://localhost:${CADDY_PORT}`     | no                                       |
+| `api.example.com`  | `80` and `443`     | `CADDY_HTTP_PORT`, `CADDY_HTTPS_PORT` | `https://api.example.com`            | automatic certificate from Let's Encrypt |
+
+The container ports are fixed: the local site listens on `8080` inside the container, so a
+different local port is set with `CADDY_PORT`, not in `SITE_ADDRESS`. In production
+`CADDY_HTTP_PORT` and `CADDY_HTTPS_PORT` must stay `80` and `443`: browsers open a domain on these
+ports, and Let's Encrypt checks only them.
+
+Always open todo-api through Caddy. Daphne does not serve static files, so with `DEBUG=False` the
+backend opened directly shows the admin and Swagger UI without styles. The backend port is not
+published to the host for this reason.
+
+### Static files
+
+Static files travel through the external Docker volume `todo-static`:
+
+1. todo-api mounts it at `/backend/static` (its `STATIC_ROOT`) and runs `collectstatic` on every
+   start, so the volume always holds the files of the running version.
+2. Caddy mounts the same volume read-only at `/srv/static` and answers `/static/*` from it
+   (`handle_path` strips the `/static` prefix: `/static/admin/css/base.css` →
+   `/srv/static/admin/css/base.css`).
+
+The volume is created by hand (`docker volume create todo-static`) and is empty until todo-api has
+started once. Check that static files are served:
+
+```bash
+curl -I http://localhost:8080/static/admin/css/base.css
+```
+
+`200` means everything works; `404` means the volume is empty (todo-api has not run `collectstatic`).
+
+### Production
+
+To serve a real domain over HTTPS:
+
+1. Point an A record of the domain (e.g. `api.example.com`) to the server's public IP.
+2. Set `SITE_ADDRESS=api.example.com` and restart Caddy.
+3. Keep `CADDY_HTTP_PORT=80` and `CADDY_HTTPS_PORT=443` and make these ports reachable from the
+   internet (firewall, cloud security groups).
+   Let's Encrypt checks domain ownership over them (ACME HTTP-01 on `80`, TLS-ALPN-01 on `443`),
+   and `80` also redirects `http` to `https`.
+4. Configure todo-api for the domain: `ALLOWED_HOSTS`, `CSRF_TRUSTED_ORIGINS` with `https://`,
+   `SECURE_SSL_REDIRECT=True` (see the todo-api README).
+
+Certificates are stored in the `caddy_data` volume and renewed automatically about 30 days before
+they expire (they are valid for 90 days). Keep the volume: without it Caddy requests a new
+certificate on every recreate and quickly hits Let's Encrypt rate limits.
+
+Caddy starts without todo-api and returns `502` for everything except `/static/*` until
+`todo-backend` is up.
 
 ## RabbitMQ topology
 
@@ -197,8 +275,11 @@ Grafana: `http://localhost:${GRAFANA_PORT}`, credentials from `GF_SECURITY_ADMIN
 | Redis (bot FSM) | `todo-infrastructure_redis_data`           |
 | Grafana         | `todo-infrastructure_grafana_data`         |
 | Loki (logs)     | `todo-infrastructure_loki_data`            |
+| Caddy (TLS certificates) | `todo-infrastructure_caddy_data`  |
+| Django static files | `todo-static` (external, shared with todo-api, filled by `collectstatic`) |
 
-`docker compose down` keeps the data; `docker compose down -v` deletes the volumes.
+`docker compose down` keeps the data; `docker compose down -v` deletes the volumes except the
+external `todo-static` (remove it with `docker volume rm todo-static`).
 
 ## Repository layout
 
@@ -207,6 +288,8 @@ Grafana: `http://localhost:${GRAFANA_PORT}`, credentials from `GF_SECURITY_ADMIN
 ├── docker-compose.yml
 ├── alloy/
 │   └── config.alloy        # log collection: Docker containers → Loki
+├── caddy/
+│   └── Caddyfile           # reverse proxy for todo-api, serves /static/*
 ├── grafana/
 │   └── datasources.yml     # Grafana → Loki datasource
 ├── loki/
