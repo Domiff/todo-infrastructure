@@ -29,6 +29,13 @@
       "destination": "todo-bot.tasks.dlq",
       "destination_type": "queue",
       "routing_key": "todo-bot.tasks"
+    },
+    {
+      "source": "todo.tasks",
+      "vhost": "/",
+      "destination": "todo-ai.tasks",
+      "destination_type": "queue",
+      "routing_key": "tasks.#"
     }
   ],
   "queues": [
@@ -40,6 +47,12 @@
     },
     {
       "name": "todo-bot.tasks.dlq",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false
+    },
+    {
+      "name": "todo-ai.tasks",
       "vhost": "/",
       "durable": true,
       "auto_delete": false
