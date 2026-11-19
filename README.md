@@ -1,7 +1,8 @@
 # ToDo Infrastructure
 
 Shared infrastructure for the ToDo services:
-[todo-api](https://github.com/Domiff/todo-api) and [todo-bot](https://github.com/Domiff/todo-bot).
+[todo-api](https://github.com/Domiff/todo-api), [todo-bot](https://github.com/Domiff/todo-bot) and
+[todo-ai](https://github.com/Domiff/todo-ai).
 The services themselves only contain application containers and connect to this stack over the
 external Docker network **`todo-network`**.
 
@@ -11,14 +12,15 @@ external Docker network **`todo-network`**.
 |---------------|----------------------|-------------------------------|---------------------------------------------|--------------------|
 | PostgreSQL 16 | `todo-pg`            | `todo-pg:5432`                | `POSTGRES_PORT`                             | todo-api           |
 | Redis 8       | `todo-redis`         | `todo-redis:6379`             | — (not published)                           | todo-bot (FSM)     |
-| RabbitMQ 4    | `todo-rabbitmq`      | `todo-rabbitmq:5672`          | `RABBITMQ_PORT`, `RABBITMQ_MANAGEMENT_PORT` | todo-api, todo-bot |
+| RabbitMQ 4    | `todo-rabbitmq`      | `todo-rabbitmq:5672`          | `RABBITMQ_PORT`, `RABBITMQ_MANAGEMENT_PORT` | todo-api, todo-bot, todo-ai |
 | rabbitmq-init | `todo-rabbitmq-init` | —                             | —                                           | one-shot job       |
 | Grafana       | `todo-grafana`       | `todo-grafana:3000`           | `GRAFANA_PORT`                              | you                |
 | Loki          | `todo-loki`          | `todo-loki:3100`              | `LOKI_PORT`                                 | Alloy, Grafana     |
 | Alloy         | `todo-alloy`         | —                             | `ALLOY_PORT`                                | —                  |
 | Caddy         | `todo-caddy`         | —                             | `CADDY_HTTP_PORT`, `CADDY_HTTPS_PORT`, `CADDY_PORT` | browsers → todo-api |
+| Qdrant 1.20   | `todo-qdrant`        | `todo-qdrant:6333` (REST), `:6334` (gRPC) | `127.0.0.1:6333`, `127.0.0.1:6334` (fixed) | todo-ai (task search) |
 
-Services should reach each other by **container name** (`todo-pg`, `todo-redis`, `todo-rabbitmq`):
+Services should reach each other by **container name** (`todo-pg`, `todo-redis`, `todo-rabbitmq`, `todo-qdrant`):
 container names are unique in the shared network, while service names like `pg` or `redis` may
 clash with other compose projects attached to it.
 
@@ -61,8 +63,8 @@ clash with other compose projects attached to it.
    CADDY_HTTPS_PORT=443              # host port for HTTPS (container port 443)
    ```
 
-   The services (todo-api, todo-bot) must use the same `POSTGRES_*` and `RABBITMQ_*` credentials
-   in their own `.env` files.
+   The services (todo-api, todo-bot, todo-ai) must use the same `POSTGRES_*` and `RABBITMQ_*`
+   credentials in their own `.env` files.
 
 3. Create the Redis users file from the template and set real passwords (it is gitignored):
 
@@ -78,7 +80,7 @@ clash with other compose projects attached to it.
    docker compose up -d
    ```
 
-Start order for the whole system: **todo-infrastructure → todo-api → todo-bot**. The services have
+Start order for the whole system: **todo-infrastructure → todo-api → todo-bot, todo-ai**. The services have
 no `depends_on` on this stack (Compose cannot depend on another project), so the infrastructure
 must already be healthy when they start.
 
@@ -154,21 +156,30 @@ Caddy starts without todo-api and returns `502` for everything except `/static/*
 ## RabbitMQ topology
 
 The broker topology is described in [`rabbitmq/definitions.json`](rabbitmq/definitions.json) and owned by this repo,
-not by the services: todo-api only publishes to an exchange, todo-bot only consumes from a queue.
+not by the services: todo-api only publishes to an exchange, todo-bot and todo-ai only consume from
+their queues.
 
 ```
 todo-api ──> todo.tasks (topic) ──tasks.#──> todo-bot.tasks ──> todo-bot
-                                                   │
-                                                rejected
-                                                   ▼
-                     todo.tasks.dlx (direct) ──todo-bot.tasks──> todo-bot.tasks.dlq
+                    │                              │
+                    │                           rejected
+                    │                              ▼
+                    │  todo.tasks.dlx (direct) ──todo-bot.tasks──> todo-bot.tasks.dlq
+                    │
+                    └──────────────tasks.#──> todo-ai.tasks ──> todo-ai
 ```
+
+Each consumer has its own queue bound to the same exchange, so every task event is copied to both:
+todo-bot sends notifications, todo-ai indexes the task for search. A new consumer only needs a new
+queue and binding here; todo-api does not change.
 
 | Object               | Type                     | Notes                                                    |
 |----------------------|--------------------------|----------------------------------------------------------|
 | `todo.tasks`         | topic exchange, durable  | todo-api publishes task events here                      |
 | `todo-bot.tasks`     | queue, durable           | consumed by todo-bot                                     |
 | binding              | `tasks.#`                | every task event (`tasks.created`, `tasks.deleted`, ...) |
+| `todo-ai.tasks`      | queue, durable           | consumed by todo-ai; no dead letter queue yet            |
+| binding              | `tasks.#`                | from `todo.tasks` to `todo-ai.tasks`, every task event   |
 | `todo.tasks.dlx`     | direct exchange, durable | receives dead messages from `todo-bot.tasks`             |
 | `todo-bot.tasks.dlq` | queue, durable           | stores dead messages; nothing consumes it                |
 | binding              | `todo-bot.tasks`         | from `todo.tasks.dlx` to `todo-bot.tasks.dlq`            |
@@ -177,6 +188,8 @@ todo-api ──> todo.tasks (topic) ──tasks.#──> todo-bot.tasks ──> 
 
 A message that todo-bot rejects without requeue is moved to `todo-bot.tasks.dlq` instead of being
 deleted. RabbitMQ adds an `x-death` header with the source queue, the reason and the time.
+
+`todo-ai.tasks` has no dead letter queue yet: a message that todo-ai rejects is deleted.
 
 This is configured with policies, not queue arguments, so it applies to existing queues:
 
@@ -206,6 +219,30 @@ the management API (`rabbitmqadmin definitions import`) and exits.
 - Users are intentionally not stored in `definitions.json`, so no password hashes end up in git.
 
 Management UI: `http://localhost:${RABBITMQ_MANAGEMENT_PORT}`.
+
+## Qdrant
+
+[Qdrant](https://qdrant.tech/documentation/) is the vector database of todo-ai: it stores task
+embeddings and finds tasks by meaning. todo-ai creates its collection (`tasks`) itself on startup;
+nothing is configured here.
+
+- **Image**: `qdrant/qdrant:v1.20.1`, pinned. Keep its minor version within one of the
+  `qdrant-client` version in todo-ai; the client warns on startup otherwise.
+- **Ports**: `6333` (REST) and `6334` (gRPC) are published on `127.0.0.1` only, so the database is
+  reachable from the host (todo-ai running locally) but not from outside. From containers in
+  `todo-network` use `http://todo-qdrant:6333`.
+- **Storage**: bind mounts on the host, not Docker volumes:
+  `/opt/qdrant/storage` (collections) and `/opt/qdrant/snapshots` (snapshots).
+  Docker creates the directories on the first start.
+
+Web UI with collections and points: `http://localhost:6333/dashboard`. Check that it is up:
+
+```bash
+curl http://127.0.0.1:6333/readyz
+```
+
+The index can always be rebuilt from todo-api's data, so losing Qdrant data loses no tasks, only
+the time to re-index them.
 
 ## Redis
 
@@ -277,9 +314,11 @@ Grafana: `http://localhost:${GRAFANA_PORT}`, credentials from `GF_SECURITY_ADMIN
 | Loki (logs)     | `todo-infrastructure_loki_data`            |
 | Caddy (TLS certificates) | `todo-infrastructure_caddy_data`  |
 | Django static files | `todo-static` (external, shared with todo-api, filled by `collectstatic`) |
+| Qdrant (task embeddings) | host directories `/opt/qdrant/storage`, `/opt/qdrant/snapshots` (bind mounts) |
 
 `docker compose down` keeps the data; `docker compose down -v` deletes the volumes except the
-external `todo-static` (remove it with `docker volume rm todo-static`).
+external `todo-static` (remove it with `docker volume rm todo-static`). Qdrant data is not in a
+volume, so `down -v` keeps it too; delete `/opt/qdrant` by hand to reset it.
 
 ## Repository layout
 
