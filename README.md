@@ -1,7 +1,7 @@
 # ToDo Infrastructure
 
 Shared infrastructure for the ToDo services:
-[todo-api](https://github.com/Domiff/todo-api), [todo-bot](https://github.com/Domiff/todo-bot) and
+[todo-api](https://github.com/Domiff/todo-api), todo-auth, [todo-bot](https://github.com/Domiff/todo-bot) and
 [todo-ai](https://github.com/Domiff/todo-ai).
 The services themselves only contain application containers and connect to this stack over the
 external Docker network **`todo-network`**.
@@ -10,8 +10,8 @@ external Docker network **`todo-network`**.
 
 | Service       | Container            | Address inside `todo-network` | Host port (from `.env`)                     | Used by            |
 |---------------|----------------------|-------------------------------|---------------------------------------------|--------------------|
-| PostgreSQL 16 | `todo-pg`            | `todo-pg:5432`                | `POSTGRES_PORT`                             | todo-api           |
-| Redis 8       | `todo-redis`         | `todo-redis:6379`             | — (not published)                           | todo-bot (FSM)     |
+| PostgreSQL 16 | `todo-pg`            | `todo-pg:5432`                | `POSTGRES_PORT`                             | todo-api, todo-auth (own databases, see [PostgreSQL](#postgresql)) |
+| Redis 8       | `todo-redis`         | `todo-redis:6379`             | — (not published)                           | todo-bot (FSM), todo-auth (token blocklist) |
 | RabbitMQ 4    | `todo-rabbitmq`      | `todo-rabbitmq:5672`          | `RABBITMQ_PORT`, `RABBITMQ_MANAGEMENT_PORT` | todo-api, todo-bot, todo-ai |
 | rabbitmq-init | `todo-rabbitmq-init` | —                             | —                                           | one-shot job       |
 | Grafana       | `todo-grafana`       | `todo-grafana:3000`           | `GRAFANA_PORT`                              | you                |
@@ -38,8 +38,8 @@ clash with other compose projects attached to it.
 2. Create `.env` next to `docker-compose.yml` (it is gitignored):
 
    ```env
-   POSTGRES_DB=todo
-   POSTGRES_USER=
+   POSTGRES_DB=postgres              # superuser's database; services have their own, see PostgreSQL
+   POSTGRES_USER=                    # superuser: administration only, never used by services
    POSTGRES_PASSWORD=
    POSTGRES_PORT=5432
 
@@ -63,8 +63,9 @@ clash with other compose projects attached to it.
    CADDY_HTTPS_PORT=443              # host port for HTTPS (container port 443)
    ```
 
-   The services (todo-api, todo-bot, todo-ai) must use the same `POSTGRES_*` and `RABBITMQ_*`
-   credentials in their own `.env` files.
+   The services (todo-api, todo-bot, todo-ai) must use the same `RABBITMQ_*` credentials in their
+   own `.env` files. For PostgreSQL each service has **its own user and database** instead of the
+   superuser above, see [PostgreSQL](#postgresql).
 
 3. Create the Redis users file from the template and set real passwords (it is gitignored):
 
@@ -80,7 +81,10 @@ clash with other compose projects attached to it.
    docker compose up -d
    ```
 
-Start order for the whole system: **todo-infrastructure → todo-api → todo-bot, todo-ai**. The services have
+5. On the first start, create the service databases and users, see
+   [Creating a service database](#creating-a-service-database).
+
+Start order for the whole system: **todo-infrastructure → todo-api, todo-auth → todo-bot, todo-ai**. The services have
 no `depends_on` on this stack (Compose cannot depend on another project), so the infrastructure
 must already be healthy when they start.
 
@@ -220,6 +224,73 @@ the management API (`rabbitmqadmin definitions import`) and exits.
 
 Management UI: `http://localhost:${RABBITMQ_MANAGEMENT_PORT}`.
 
+## PostgreSQL
+
+One PostgreSQL server (`todo-pg`) hosts a separate database for every service that needs one
+([database per service](https://microservices.io/patterns/data/database-per-service)): each
+service owns its data, connects with its own user and cannot reach other services' databases.
+
+| Database    | Owner (user) | Used by   | Service `.env`                                                  |
+|-------------|--------------|-----------|-----------------------------------------------------------------|
+| `todo_api`  | `todo_api`   | todo-api  | `POSTGRES_DB=todo_api`, `POSTGRES_USER=todo_api`                |
+| `todo_auth` | `todo_auth`  | todo-auth | `POSTGRES_DB=todo_auth`, `POSTGRES_USER=todo_auth`              |
+| `postgres`  | superuser    | —         | maintenance database for the superuser from `POSTGRES_USER`     |
+
+Services connect to `todo-pg:5432` from `todo-network`, or to `localhost:${POSTGRES_PORT}` when
+running on the host.
+
+How the isolation works:
+
+- **Service users are not superusers** and cannot create databases or roles.
+- **Each service user owns its database.** In PostgreSQL 15+ the `public` schema belongs to
+  `pg_database_owner`, so only the database owner can create tables there; migrations (Alembic,
+  Django) run as the service user.
+- **`CONNECT` is revoked from `PUBLIC`** on every service database, so other users cannot even
+  connect to it. Only the owner and the superuser can.
+- Data of different services is never joined or linked with foreign keys; services exchange data
+  through their APIs and RabbitMQ events.
+
+### Creating a service database
+
+The image only creates the superuser and `POSTGRES_DB` on an empty volume, so service databases are
+created by hand once. Connect as the superuser:
+
+```bash
+docker exec -it todo-pg psql -U <POSTGRES_USER> -d postgres
+```
+
+Then, for a service named `todo_x`:
+
+```sql
+CREATE ROLE todo_x LOGIN;
+\password todo_x
+CREATE DATABASE todo_x OWNER todo_x;
+REVOKE ALL ON DATABASE todo_x FROM PUBLIC;
+```
+
+`\password` asks for the password interactively, so it does not end up in the shell history or
+logs. Put the same password into the service's `.env` (`POSTGRES_PASSWORD`).
+
+Check the result:
+
+```sql
+SELECT datname, pg_get_userbyid(datdba) AS owner, datacl
+FROM pg_database WHERE NOT datistemplate;
+```
+
+Each service database must be owned by its user and have only `{todo_x=CTc/todo_x}` in `datacl`.
+
+Things to keep in mind:
+
+- Create the database with `OWNER todo_x`. A database created by the superuser without an owner
+  (e.g. from a GUI client) belongs to the superuser, and migrations fail with
+  `permission denied for schema public`. Fix it with `ALTER DATABASE todo_x OWNER TO todo_x;`.
+- Do not change the owner of the `public` schema by hand; it must stay `pg_database_owner`.
+- Do not use `REASSIGN OWNED BY <superuser>`: the superuser also owns system objects, and the
+  command fails. Transfer ownership with `ALTER DATABASE/TABLE/SEQUENCE ... OWNER TO` instead.
+- `psql -U <POSTGRES_USER>` without `-d` connects to a database named like the user, which may not
+  exist; pass `-d postgres`.
+
 ## Qdrant
 
 [Qdrant](https://qdrant.tech/documentation/) is the vector database of todo-ai: it stores task
@@ -246,8 +317,9 @@ the time to re-index them.
 
 ## Redis
 
-Redis stores the bot's FSM state. It starts with [`redis/redis.conf`](redis/redis.conf) and has no
-port published to the host: only containers in `todo-network` can reach it.
+Redis stores the bot's FSM state and the revoked tokens of todo-auth. It starts with
+[`redis/redis.conf`](redis/redis.conf) and has no port published to the host: only containers in
+`todo-network` can reach it, as `todo-redis:6379`.
 
 Configuration (`redis/redis.conf`):
 
@@ -267,6 +339,7 @@ Users (`redis/redis.acl`, created from [`redis/redis.acl.example`](redis/redis.a
 |---------------|----------------------------------------------------------|----------------------------------|
 | `default`     | disabled                                                 | —                                |
 | `todo-bot`    | keys `fsm:*` only; read, write and keyspace commands, no dangerous ones | todo-bot (`REDIS_USER`, `REDIS_PASSWORD`) |
+| `todo-auth`   | keys `auth:*` only; read, write and keyspace commands, no dangerous ones (no `PING`) | todo-auth (`REDIS_USER`, `REDIS_PASSWORD`) |
 | `healthcheck` | `PING` only                                              | the container healthcheck        |
 
 The healthcheck runs `redis-cli --user healthcheck ping` and takes the password from
@@ -275,6 +348,9 @@ The healthcheck runs `redis-cli --user healthcheck ping` and takes the password 
 `redis/redis.acl` contains passwords and is gitignored. An empty or broken ACL file is a common
 cause of problems: with a syntax error Redis does not start, and with an empty file the `default`
 user stays enabled without a password, so `protected-mode` rejects the bot.
+
+Redis reads the ACL file only on start. After adding a user to `redis/redis.acl`, restart the
+container (`docker compose restart redis`); until then the new user gets `WRONGPASS`.
 
 ## Logs
 
@@ -307,9 +383,9 @@ Grafana: `http://localhost:${GRAFANA_PORT}`, credentials from `GF_SECURITY_ADMIN
 
 | Data            | Docker volume                              |
 |-----------------|--------------------------------------------|
-| PostgreSQL      | `todo-infrastructure_pg_data`              |
+| PostgreSQL (`todo_api`, `todo_auth`) | `todo-infrastructure_pg_data` |
 | RabbitMQ        | `todo-infrastructure_rabbitmq_data`        |
-| Redis (bot FSM) | `todo-infrastructure_redis_data`           |
+| Redis (bot FSM, auth blocklist) | `todo-infrastructure_redis_data` |
 | Grafana         | `todo-infrastructure_grafana_data`         |
 | Loki (logs)     | `todo-infrastructure_loki_data`            |
 | Caddy (TLS certificates) | `todo-infrastructure_caddy_data`  |
