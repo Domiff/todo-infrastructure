@@ -17,7 +17,7 @@ external Docker network **`todo-network`**.
 | Grafana       | `todo-grafana`       | `todo-grafana:3000`           | `GRAFANA_PORT`                              | you                |
 | Loki          | `todo-loki`          | `todo-loki:3100`              | `LOKI_PORT`                                 | Alloy, Grafana     |
 | Alloy         | `todo-alloy`         | —                             | `ALLOY_PORT`                                | —                  |
-| Caddy         | `todo-caddy`         | —                             | `CADDY_HTTP_PORT`, `CADDY_HTTPS_PORT`, `CADDY_PORT` | browsers → todo-api |
+| Caddy         | `todo-caddy`         | —                             | `CADDY_HTTP_PORT`, `CADDY_HTTPS_PORT`, `CADDY_PORT` | browsers → todo-api, todo-auth |
 | Qdrant 1.20   | `todo-qdrant`        | `todo-qdrant:6333` (REST), `:6334` (gRPC) | `127.0.0.1:6333`, `127.0.0.1:6334` (fixed) | todo-ai (task search) |
 
 Services should reach each other by **container name** (`todo-pg`, `todo-redis`, `todo-rabbitmq`, `todo-qdrant`):
@@ -90,15 +90,19 @@ must already be healthy when they start.
 
 ## Reverse proxy
 
-[Caddy](https://caddyserver.com/docs/) is the entry point for todo-api. It serves the Django static
-files itself and forwards everything else to the backend:
+[Caddy](https://caddyserver.com/docs/) is the entry point for todo-api and todo-auth. It serves
+the Django static files itself, sends `/auth/*` to todo-auth and everything else to todo-api:
 
 ```
                     ┌─────────────────── todo-caddy ───────────────────┐
 browser ──HTTP(S)──>│  /static/*  → /srv/static (volume todo-static)   │
+                    │  /auth/*    → todo-auth:8010 (Uvicorn)           │
                     │  everything else → todo-backend:8000 (Daphne)    │
                     └──────────────────────────────────────────────────┘
 ```
+
+Each path goes to exactly one `handle` block, so `/auth/*` never reaches todo-api. The path is passed
+on unchanged: `/auth/login` arrives at todo-auth as `/auth/login`.
 
 The config is [`caddy/Caddyfile`](caddy/Caddyfile). The site address comes from `SITE_ADDRESS` in
 `.env` (`{$SITE_ADDRESS}` is substituted when Caddy loads the config, so restart Caddy after
@@ -114,9 +118,9 @@ different local port is set with `CADDY_PORT`, not in `SITE_ADDRESS`. In product
 `CADDY_HTTP_PORT` and `CADDY_HTTPS_PORT` must stay `80` and `443`: browsers open a domain on these
 ports, and Let's Encrypt checks only them.
 
-Always open todo-api through Caddy. Daphne does not serve static files, so with `DEBUG=False` the
-backend opened directly shows the admin and Swagger UI without styles. The backend port is not
-published to the host for this reason.
+Always open todo-api and todo-auth through Caddy. Daphne does not serve static files, so with
+`DEBUG=False` the backend opened directly shows the admin and Swagger UI without styles. Neither
+service publishes its port to the host.
 
 ### Static files
 
@@ -149,13 +153,16 @@ To serve a real domain over HTTPS:
    and `80` also redirects `http` to `https`.
 4. Configure todo-api for the domain: `ALLOWED_HOSTS`, `CSRF_TRUSTED_ORIGINS` with `https://`,
    `SECURE_SSL_REDIRECT=True` (see the todo-api README).
+5. Configure todo-auth for production: `IS_DEBUG=false` (hides `/docs` and sends the admin session
+   cookie over HTTPS only) and `CORS_ORIGINS` with the frontend origin, e.g.
+   `["https://app.example.com"]` (see the todo-auth README).
 
 Certificates are stored in the `caddy_data` volume and renewed automatically about 30 days before
 they expire (they are valid for 90 days). Keep the volume: without it Caddy requests a new
 certificate on every recreate and quickly hits Let's Encrypt rate limits.
 
-Caddy starts without todo-api and returns `502` for everything except `/static/*` until
-`todo-backend` is up.
+Caddy starts without the services and returns `502` for a route until its container is up:
+`/auth/*` until `todo-auth`, everything else except `/static/*` until `todo-backend`.
 
 ## RabbitMQ topology
 
@@ -404,7 +411,7 @@ volume, so `down -v` keeps it too; delete `/opt/qdrant` by hand to reset it.
 ├── alloy/
 │   └── config.alloy        # log collection: Docker containers → Loki
 ├── caddy/
-│   └── Caddyfile           # reverse proxy for todo-api, serves /static/*
+│   └── Caddyfile           # reverse proxy for todo-api and todo-auth, serves /static/*
 ├── grafana/
 │   └── datasources.yml     # Grafana → Loki datasource
 ├── loki/
