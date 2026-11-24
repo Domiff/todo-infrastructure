@@ -97,6 +97,7 @@ the Django static files itself, sends `/auth/*` to todo-auth and everything else
                     ┌─────────────────── todo-caddy ───────────────────┐
 browser ──HTTP(S)──>│  /static/*  → /srv/static (volume todo-static)   │
                     │  /auth/*    → todo-auth:8010 (Uvicorn)           │
+                    │  /ai/*    → todo-ai:8020 (Uvicorn)               │
                     │  everything else → todo-backend:8000 (Daphne)    │
                     └──────────────────────────────────────────────────┘
 ```
