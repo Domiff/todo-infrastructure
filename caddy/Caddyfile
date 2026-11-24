@@ -7,6 +7,10 @@
     handle /auth/* {
         reverse_proxy todo-auth:8010
     }
+    
+    handle /ai/* {
+        reverse_proxy todo-ai:8020
+    }
 
     handle {
         reverse_proxy todo-backend:8000
